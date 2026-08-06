@@ -152,6 +152,63 @@ let installerPath = appSupport.appendingPathComponent("fever-installer.exe")
 let feverGamesDir = winePrefix.appendingPathComponent("drive_c/Program Files/FeverGames")
 let launcherName = "FeverGamesLauncher.exe"
 
+// ============================================================
+// 运行时配置文件（conf/）读取
+// ============================================================
+// 约定：conf/<name>.conf（与 wine-prefix 同级，位于 appSupport 下），
+// 独立于可重建的 wine-prefix：重置模拟器环境不会清掉配置。
+// 极简 INI 风格（key = value，# / ; 注释，[section] 分组）。
+// 基本原则：配置全部可选。文件缺失、读取失败、解析失败、值为空等任何异常，
+// 一律回落程序内硬编码默认值，绝不影响流程。
+
+/// 读取 conf 目录下某配置文件中指定 key 的 value；任何异常返回 nil（调用方回落默认）。
+func confValue(_ confName: String, key: String) -> String? {
+    let confURL = appSupport.appendingPathComponent("conf").appendingPathComponent(confName)
+    guard let content = try? String(contentsOf: confURL, encoding: .utf8) else {
+        return nil  // 文件不存在 / 读取失败，静默回落
+    }
+    for rawLine in content.split(whereSeparator: { $0 == "\n" || $0 == "\r" }) {
+        let line = rawLine.trimmingCharacters(in: .whitespaces)
+        if line.isEmpty || line.hasPrefix("#") || line.hasPrefix(";") || line.hasPrefix("[") {
+            continue  // 空行 / 注释 / [section]
+        }
+        guard let eq = line.firstIndex(of: "=") else { continue }  // 坏行跳过
+        let k = line[..<eq].trimmingCharacters(in: .whitespaces)
+        let v = line[line.index(after: eq)...].trimmingCharacters(in: .whitespaces)
+        if k.caseInsensitiveCompare(key) == .orderedSame && !v.isEmpty {
+            return v
+        }
+    }
+    return nil
+}
+
+/// 读取 conf 目录下某配置文件的所有条目（key-value 对），返回 [key: value]。
+/// 文件不存在 / 读取失败返回 nil；无有效条目返回空字典。
+/// 忽略注释、section、坏行；同一 key 多次出现时保留最后一次。
+func confDump(_ confName: String) -> [String: String]? {
+    let confURL = appSupport.appendingPathComponent("conf").appendingPathComponent(confName)
+    guard let content = try? String(contentsOf: confURL, encoding: .utf8) else {
+        return nil
+    }
+    var result = [String: String]()
+    for rawLine in content.split(whereSeparator: { $0 == "\n" || $0 == "\r" }) {
+        let line = rawLine.trimmingCharacters(in: .whitespaces)
+        if line.isEmpty || line.hasPrefix("#") || line.hasPrefix(";") || line.hasPrefix("[") {
+            continue
+        }
+        guard let eq = line.firstIndex(of: "=") else { continue }
+        let k = line[..<eq].trimmingCharacters(in: .whitespaces)
+        let v = line[line.index(after: eq)...].trimmingCharacters(in: .whitespaces)
+        if !k.isEmpty && !v.isEmpty {
+            result[k] = v
+        }
+    }
+    return result
+}
+
+/// 实际使用的包体下载地址：优先 conf/download.conf，缺失/无效则用硬编码默认值。
+let effectiveDownloadURL = confValue("download.conf", key: "url") ?? feverDownloadURL
+
 func ensureDirs() {
     try? fm.createDirectory(at: appSupport, withIntermediateDirectories: true)
     try? fm.createDirectory(at: logsDir, withIntermediateDirectories: true)
@@ -191,7 +248,29 @@ func log(_ msg: String) {
     }
 }
 
-// Wine 路径（从 app bundle Resources 取，fallback 到绝对路径）
+// ============================================================
+// 运行时配置生效情况日志
+// ============================================================
+// 仅在检测到 conf 配置时输出，未配置则不打印（避免噪音）。
+// 用途：确认 conf/backend.conf、conf/download.conf 是否被识别、是否生效。
+func logRuntimeConfig() {
+    // 下载链接：仅当 download.conf 配了 url 才打印
+    if let confURL = confValue("download.conf", key: "url") {
+        log("下载链接来自 conf/download.conf：\(confURL)")
+    }
+
+    // backend：打印 backend.conf 中所有条目，确认解析是否正确
+    if let entries = confDump("backend.conf") {
+        if entries.isEmpty {
+            log("conf/backend.conf 存在但无有效条目")
+        } else {
+            for (exe, backend) in entries {
+                log("conf/backend.conf：\(exe) -> \(backend)")
+            }
+        }
+    }
+}
+logRuntimeConfig()
 let wineRoot: String? = {
     // 优先：Bundle Resources
     if let r = Bundle.main.resourceURL?.appendingPathComponent("wine-release") {
@@ -1457,7 +1536,7 @@ func bringFeverToFront(_ game: Game) {
 // 下载管理器
 // ============================================================
 func downloadInstaller() {
-    guard let url = URL(string: feverDownloadURL) else {
+    guard let url = URL(string: effectiveDownloadURL) else {
         showError("下载地址无效"); return
     }
 

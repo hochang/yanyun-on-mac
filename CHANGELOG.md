@@ -4,6 +4,11 @@
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-08-06
+
+### Added
+- 增加支持第五人格
+
 ## [0.1.1] - 2026-07-09
 
 ### Added
@@ -27,6 +32,7 @@
 - winecompat 兼容组件：自动选渲染后端、处理子进程环境、修复窗口层级
 - 一键构建脚本（`dev-deploy.sh`、`build-release.sh`）
 
-[Unreleased]: ../../compare/v0.1.1...HEAD
+[Unreleased]: ../../compare/v0.1.2...HEAD
+[0.1.2]: ../../releases/tag/v0.1.2
 [0.1.1]: ../../releases/tag/v0.1.1
 [0.1.0]: ../../releases/tag/v0.1.0

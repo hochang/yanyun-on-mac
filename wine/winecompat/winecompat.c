@@ -23,6 +23,7 @@
 #include <dlfcn.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <stdio.h>
 #include <unistd.h>
 #include <pthread.h>
@@ -60,6 +61,148 @@ static int wstr_ends_with_icase(const WCHAR *str, int str_len, const char *suffi
         if (c != (WCHAR)s) return 0;
     }
     return 1;
+}
+
+/* ========== conf 配置文件读取 ========== */
+
+/*
+ * 运行时配置：$WINEPREFIX 的父目录下 conf/<name>.conf（与 wine-prefix 同级），
+ * 极简 INI 风格，零依赖手写解析。放父目录使配置独立于可重建的 prefix。
+ * 基本原则：配置全部可选。文件缺失、打开/读取失败、解析失败、值非法等任何异常
+ * 一律回落硬编码默认值，绝不中断进程启动或崩溃。
+ * 读配置只在进程启动时发生一次，非热路径，无性能顾虑。
+ */
+
+#define CONF_LINE_MAX 512
+#define CONF_VAL_MAX  512
+
+/* trim 字符串两端空白（in-place），返回 trim 后的起始指针 */
+static char *conf_trim(char *s) {
+    while (*s == ' ' || *s == '\t' || *s == '\r' || *s == '\n') s++;
+    char *end = s + strlen(s);
+    while (end > s) {
+        char c = *(end - 1);
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') end--;
+        else break;
+    }
+    *end = '\0';
+    return s;
+}
+
+/*
+ * 在配置文件中查找指定 key 的 value。
+ * conf_name: 文件名（不含目录，如 "backend.conf"）
+ * key:       要查找的键（不区分大小写）
+ * out:       输出缓冲，容量 out_cap
+ * 返回 1 表示找到并写入 out；返回 0 表示未找到 / 文件缺失 / 任何异常（调用方回落默认）。
+ *
+ * 容错：打开失败静默返回 0；逐行解析，坏行（无 '=' 或超长）跳过继续；
+ *      忽略 '#'/';' 注释与空行；[section] 行跳过；固定缓冲 + 长度检查防溢出。
+ */
+static int conf_get(const char *conf_name, const char *key, char *out, int out_cap) {
+    if (!conf_name || !key || !out || out_cap <= 0) return 0;
+
+    const char *prefix = getenv("WINEPREFIX");
+    if (!prefix || !prefix[0]) return 0;  /* 无 WINEPREFIX，回落默认 */
+
+    /*
+     * conf 目录放在 WINEPREFIX 的父目录下（与 wine-prefix 同级），
+     * 使其独立于可重建的 prefix：重置模拟器环境（删除 wine-prefix）不会清掉配置。
+     * 取 WINEPREFIX 父目录 = 去掉末尾斜杠后，截断到最后一个 '/'。
+     */
+    char base[1024];
+    int bn = snprintf(base, sizeof(base), "%s", prefix);
+    if (bn <= 0 || bn >= (int)sizeof(base)) return 0;
+    /* 去掉末尾多余斜杠 */
+    while (bn > 1 && base[bn - 1] == '/') base[--bn] = '\0';
+    /* 截断到最后一个 '/'（得到父目录） */
+    char *slash = strrchr(base, '/');
+    if (!slash || slash == base) return 0;  /* 无父目录，回落默认 */
+    *slash = '\0';
+
+    char path[1024];
+    int n = snprintf(path, sizeof(path), "%s/conf/%s", base, conf_name);
+    if (n <= 0 || n >= (int)sizeof(path)) return 0;  /* 路径超长，回落 */
+
+    FILE *fp = fopen(path, "r");
+    if (!fp) return 0;  /* 文件不存在 / 打开失败，静默回落 */
+
+    int found = 0;
+    char line[CONF_LINE_MAX];
+    while (fgets(line, sizeof(line), fp)) {
+        /* 若本行超长（未读到换行且缓冲已满），丢弃残余部分避免误解析 */
+        size_t len = strlen(line);
+        if (len == sizeof(line) - 1 && line[len - 1] != '\n') {
+            int ch;
+            while ((ch = fgetc(fp)) != '\n' && ch != EOF) { /* 跳过残余 */ }
+            continue;  /* 超长行跳过 */
+        }
+
+        char *p = conf_trim(line);
+        if (p[0] == '\0' || p[0] == '#' || p[0] == ';') continue;  /* 空行/注释 */
+        if (p[0] == '[') continue;  /* [section] 行跳过 */
+
+        char *eq = strchr(p, '=');
+        if (!eq) continue;  /* 无 '='，坏行跳过 */
+
+        *eq = '\0';
+        char *k = conf_trim(p);
+        char *v = conf_trim(eq + 1);
+
+        /* key 不区分大小写比较 */
+        if (strcasecmp(k, key) == 0) {
+            if (v[0] == '\0') continue;  /* value 为空，视为未配置，继续找 */
+            int vn = snprintf(out, out_cap, "%s", v);
+            if (vn > 0 && vn < out_cap) {
+                found = 1;
+                break;
+            }
+            /* value 超出缓冲，视为非法，回落默认 */
+        }
+    }
+
+    fclose(fp);
+    return found;
+}
+
+/*
+ * backend 名 → 内部编号映射。未识别返回 0。
+ * 编号与下方 backend switch 一致：wined3d=1, dxmt=2, d3dmetal=3, vkd3d=5, dxvk=6。
+ */
+static int conf_backend_name_to_id(const char *name) {
+    if (!name) return 0;
+    if (strcasecmp(name, "wined3d") == 0)  return 1;
+    if (strcasecmp(name, "dxmt") == 0)     return 2;
+    if (strcasecmp(name, "d3dmetal") == 0) return 3;
+    if (strcasecmp(name, "vkd3d") == 0)    return 5;
+    if (strcasecmp(name, "dxvk") == 0)     return 6;
+    return 0;  /* 未识别，回落默认 */
+}
+
+/*
+ * 提取当前进程 exe 的文件名（basename，含扩展名），写入 out（ASCII 小写）。
+ * exe_path 为宽字符路径，wchar_len 为长度。成功返回 1，失败返回 0。
+ * 用于按 exe 名查 backend.conf。
+ */
+static int conf_exe_basename(const WCHAR *exe_path, int wchar_len, char *out, int out_cap) {
+    if (!exe_path || wchar_len <= 0 || !out || out_cap <= 0) return 0;
+
+    /* 从尾部找最后一个 '\\' 或 '/' */
+    int start = 0;
+    for (int i = 0; i < wchar_len; i++) {
+        WCHAR c = exe_path[i];
+        if (c == '\\' || c == '/') start = i + 1;
+    }
+
+    int j = 0;
+    for (int i = start; i < wchar_len && j < out_cap - 1; i++) {
+        WCHAR c = exe_path[i];
+        if (c <= 0 || c >= 128) return 0;  /* 非 ASCII，放弃 */
+        if (c >= 'A' && c <= 'Z') c += 32;  /* 转小写 */
+        out[j++] = (char)c;
+    }
+    out[j] = '\0';
+    return (j > 0) ? 1 : 0;
 }
 
 /* 检测当前进程是否运行在 Rosetta 2 转译层下 */
@@ -812,7 +955,29 @@ static void init_winecompat(void) {
      */
     int backend = 0;  /* 0=未决定 */
 
+    /*
+     * Step 0: 读 conf/backend.conf（在 WINEPREFIX 父目录下），按 exe 名匹配 backend。
+     * 优先级：SIM_BACKEND_OVERRIDE(env) > backend.conf > 硬编码 exe 匹配 > 自动检测。
+     * 配置非必须：文件缺失/解析失败/值非法一律回落，backend 保持 0 继续走下面逻辑。
+     */
     if (exe_path && wchar_len > 0) {
+        char exe_name[128];
+        if (conf_exe_basename(exe_path, wchar_len, exe_name, sizeof(exe_name))) {
+            char val[CONF_VAL_MAX];
+            if (conf_get("backend.conf", exe_name, val, sizeof(val))) {
+                int id = conf_backend_name_to_id(val);
+                if (id != 0) {
+                    backend = id;
+#ifdef DEBUG
+                    fprintf(stderr, "[compat] backend.conf: %s -> %s (id=%d)\n",
+                            exe_name, val, id);
+#endif
+                }
+            }
+        }
+    }
+
+    if (backend == 0 && exe_path && wchar_len > 0) {
         if (wstr_ends_with_icase(exe_path, wchar_len, "\\yysls.exe") ||
             wstr_ends_with_icase(exe_path, wchar_len, "\\wwm.exe")) {
             backend = 2;  /* dxmt */
@@ -822,6 +987,8 @@ static void init_winecompat(void) {
              * 纯虚调用崩溃(BlitObject 对已析构 resource 调 GetType)，现已由
              * start_dxmt_purevirt_patch() 运行时热修复，dxmt 可稳定使用。
              */
+            backend = 2;  /* dxmt */
+        } else if (wstr_ends_with_icase(exe_path, wchar_len, "\\dwrg.exe")) {
             backend = 2;  /* dxmt */
         }
     }
