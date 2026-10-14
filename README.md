@@ -4,7 +4,7 @@
 
 # Yanyun on Mac
 
-在 Mac 上玩燕云十六声、遗忘之海和第五人格，不用装 Windows
+在 Mac 上玩燕云十六声（国服 / 国际服）、遗忘之海和第五人格，不用装 Windows
 
 [![License](https://img.shields.io/badge/license-LGPL--2.1-blue.svg)](./LICENSE)
 [![Platform](https://img.shields.io/badge/platform-macOS%2015%2B-lightgrey.svg)](#系统要求)
@@ -26,7 +26,7 @@
 
 ## 快速开始
 
-到 [Releases](../../releases) 下载对应游戏的 DMG：燕云是 Yanyun.dmg，遗忘之海是 YWZH.dmg，第五人格是 DWRG.dmg。打开后把里面的 .app 拖进 Applications 就行。
+到 [Releases](../../releases) 下载对应游戏的 DMG：燕云是 Yanyun.dmg，燕云国际服（Where Winds Meet）是 WWM.dmg，遗忘之海是 YWZH.dmg，第五人格是 DWRG.dmg。打开后把里面的 .app 拖进 Applications 就行。
 
 > 首次运行 macOS 可能会提示「无法验证开发者」，需要在「系统设置 → 隐私与安全性」中点击「仍要打开」。
 
@@ -88,7 +88,7 @@ mkdir -p output
 # 指定 .app / .dmg 的输出目录
 export OUTPUT_DIR=~/Desktop
 
-# 开发构建 + 部署（游戏名填 yanyun、ywzh 或 dwrg，不带参数会让你选）
+# 开发构建 + 部署（游戏名填 yanyun、wwm、ywzh 或 dwrg，不带参数会让你选）
 bash scripts/dev-deploy.sh yanyun
 
 # 正式打包（签名 + DMG）
@@ -110,6 +110,7 @@ app/                    # macOS App（Swift / AppKit）
 │   └── main.swift      # 主程序（两个游戏共用）
 └── targets/            # 每个游戏各自的配置、图标、FAQ
     ├── yanyun/
+    ├── wwm/            # 燕云国际服（游戏自带 launcher，不经发烧平台）
     ├── ywzh/
     └── dwrg/
 wine/

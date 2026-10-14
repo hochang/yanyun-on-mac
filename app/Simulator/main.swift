@@ -10,8 +10,11 @@ app.setActivationPolicy(.regular)
 /// 单个游戏的全部差异项，逻辑代码不含硬编码，值全部来自此结构。
 struct GameConfig: Decodable {
     let appIdentifier: String    // App Support 目录名 + 进程匹配
-    let feverDownloadURL: String // 发烧平台安装器下载地址
-    let gameId: Int              // 发烧平台数字游戏 ID
+    let feverDownloadURL: String // 安装器下载地址（发烧平台安装器 / 独立游戏安装包；支持直链、JSON 接口、官网下载页）
+    let platform: String?        // 启动方式："fever"（缺省，发烧平台）/ "standalone"（游戏自带 launcher，如国际服）
+    let gameId: Int?             // 发烧平台数字游戏 ID（仅 fever）
+    let launcherUninstallKey: String? // 独立 launcher 安装后写入的 Uninstall 注册表键名（仅 standalone，用于定位安装目录）
+    let launcherRelPath: String? // launcher 相对安装根目录的路径，Windows 分隔符（仅 standalone）
     let gameKey: String          // 透传标识："yysls" / "ywzh"
     let title: String            // 主界面游戏标题
     let windowTitle: String      // 窗口标题
@@ -105,6 +108,14 @@ app.mainMenu = mainMenu
 // ============================================================
 let appIdentifier = cfg.appIdentifier  // App Support 目录名，也用于进程匹配
 let feverDownloadURL = cfg.feverDownloadURL
+/// standalone：不经发烧平台，直接安装并运行游戏自带的 launcher（如燕云国际服）
+let isStandalone = cfg.platform == "standalone"
+if isStandalone && (cfg.launcherUninstallKey == nil || cfg.launcherRelPath == nil) {
+    fatalConfigError("platform=standalone 需要配置 launcherUninstallKey 与 launcherRelPath。")
+}
+if !isStandalone && cfg.gameId == nil {
+    fatalConfigError("config.plist 缺少 gameId。")
+}
 
 /// 是否启用 Wine 详细日志调试模式
 /// true  → WINEDEBUG 输出详细日志到 Logs/wine_debug.log
@@ -148,7 +159,7 @@ let winePrefix = appSupport.appendingPathComponent("wine-prefix")
 // 用户自行放置，不随 App 分发；存在时 ywzh 等 D3D12 游戏优先走 Metal 直译路径。
 let gptkDir = appSupport.appendingPathComponent("gptk")
 let logsDir = appSupport.appendingPathComponent("Logs")
-let installerPath = appSupport.appendingPathComponent("fever-installer.exe")
+let installerPath = appSupport.appendingPathComponent(isStandalone ? "game-installer.exe" : "fever-installer.exe")
 let feverGamesDir = winePrefix.appendingPathComponent("drive_c/Program Files/FeverGames")
 let launcherName = "FeverGamesLauncher.exe"
 
@@ -343,6 +354,22 @@ func isFeverRunning() -> Bool {
     return pg.terminationStatus == 0
 }
 
+/// standalone：检测游戏自带 launcher 或游戏本体是否在运行（按 Wine 进程命令行中的 exe 名匹配）
+func isStandaloneRunning() -> Bool {
+    // launcher 取相对路径最后两级（如 deploy\launcher.exe），避免误匹配其他游戏的同名 launcher.exe
+    let launcherTail = (cfg.launcherRelPath ?? "").split(separator: "\\").suffix(2)
+        .map { NSRegularExpression.escapedPattern(for: String($0)) }.joined(separator: "[\\\\/]")
+    let gameExe = NSRegularExpression.escapedPattern(for: "\(cfg.gameKey).exe")
+    let pg = Process()
+    pg.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
+    pg.arguments = ["-i", "-f", "[\\\\/](\(launcherTail)|\(gameExe))"]
+    pg.standardOutput = FileHandle.nullDevice
+    pg.standardError = FileHandle.nullDevice
+    try? pg.run()
+    pg.waitUntilExit()
+    return pg.terminationStatus == 0
+}
+
 // ============================================================
 // 游戏模型（数据驱动多图标）
 // ============================================================
@@ -352,9 +379,9 @@ struct Game {
     let id: String            // 透传标识："yysls" / "ywzh"
     let title: String         // 标题文案
     let iconResource: String  // App Resources 中的图标文件名（不含后缀）
-    let gameId: Int           // 发烧平台数字游戏 ID
+    let gameId: Int?          // 发烧平台数字游戏 ID（standalone 为 nil）
     /// 传给 launcher 的启动 URL
-    var launchURL: String { "fevergames://mygame/?gameId=\(gameId)" }
+    var launchURL: String { "fevergames://mygame/?gameId=\(gameId ?? 0)" }
 }
 let games = [
     Game(id: cfg.gameKey, title: cfg.title, iconResource: "game-icon", gameId: cfg.gameId),
@@ -530,8 +557,12 @@ class ClickHandler: NSObject {
             // 播放残影爆开动画（作用在被点击的图标上）
             playGhostExpandAnimation(on: iconView)
 
-            // 如果游戏平台已经在运行，直接拉起窗口（不新开 wine 进程）
-            if isFeverRunning() {
+            // standalone：launcher/游戏已在运行时不再重复启动（launcher 单实例，重复启动会弹"已在运行"）
+            if isStandalone && isStandaloneRunning() {
+                log("launcher 或游戏已在运行，跳过重复启动: \(game.id)")
+                NSApp.deactivate()
+            } else if !isStandalone && isFeverRunning() {
+                // 如果游戏平台已经在运行，直接拉起窗口（不新开 wine 进程）
                 log("游戏平台已在运行，尝试拉起窗口: \(game.id)")
                 bringFeverToFront(game)
             } else {
@@ -1439,6 +1470,103 @@ func findFeverLauncher() -> (path: String, workDir: String)? {
     return nil
 }
 
+// ============================================================
+// standalone launcher 定位（安装目录由用户在安装器中自选，可能在外接盘）
+// ============================================================
+/// Windows 路径 → macOS 路径（经 dosdevices 盘符映射：c: → drive_c，d: 等 → 外接设备）
+func unixPath(fromWindows winPath: String) -> URL? {
+    let p = winPath.trimmingCharacters(in: CharacterSet(charactersIn: "\" "))
+    guard p.count >= 3, p.dropFirst().hasPrefix(":\\") else { return nil }
+    var url = winePrefix.appendingPathComponent("dosdevices").appendingPathComponent(p.prefix(2).lowercased())
+    for comp in p.dropFirst(3).split(separator: "\\") { url.appendPathComponent(String(comp)) }
+    return url
+}
+
+/// 反转义 Wine .reg 文件中的字符串值：\\ → \，\" → "，\x{4e2d} → 中
+func unescapeRegValue(_ s: Substring) -> String {
+    var out = ""
+    var i = s.startIndex
+    while i < s.endIndex {
+        let c = s[i]
+        let next = s.index(after: i)
+        if c == "\\", next < s.endIndex {
+            if s[next] == "x", s[s.index(after: next)...].hasPrefix("{"),
+               let close = s[next...].firstIndex(of: "}"),
+               let code = UInt32(s[s.index(next, offsetBy: 2)..<close], radix: 16),
+               let scalar = UnicodeScalar(code) {
+                out.unicodeScalars.append(scalar)
+                i = s.index(after: close)
+            } else {
+                out.append(s[next])
+                i = s.index(after: next)
+            }
+            continue
+        }
+        out.append(c)
+        i = next
+    }
+    return out
+}
+
+/// 从 system.reg / user.reg 读取 launcher 安装根目录（Windows 路径）。
+/// 32 位安装器写 HKLM 会落到 Wow6432Node，故按键名后缀匹配，不区分具体分支。
+/// 注意：wineserver 约 30 秒才把注册表写回磁盘，安装刚结束时可能还读不到。
+func standaloneInstallRoot() -> String? {
+    guard let key = cfg.launcherUninstallKey?.lowercased() else { return nil }
+    let sectionSuffix = "\\\\uninstall\\\\\(key)]"
+    for regName in ["system.reg", "user.reg"] {
+        guard let content = try? String(contentsOf: winePrefix.appendingPathComponent(regName), encoding: .utf8) else { continue }
+        var inSection = false
+        var uninstallString: String?
+        for rawLine in content.split(separator: "\n") {
+            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            if line.hasPrefix("[") {
+                if inSection { break }
+                // 节头形如 [Software\\...\\Uninstall\\wwm_launcher_uninstall] 1700000000
+                inSection = line.lowercased().split(separator: " ").first.map { $0.hasSuffix(sectionSuffix) } ?? false
+                continue
+            }
+            guard inSection, line.hasPrefix("\""), line.hasSuffix("\"") else { continue }
+            for name in ["InstallLocation", "UninstallString"] {
+                let prefix = "\"\(name)\"=\""
+                guard line.hasPrefix(prefix) else { continue }
+                let value = unescapeRegValue(line.dropFirst(prefix.count).dropLast())
+                if name == "InstallLocation", !value.isEmpty { return value }
+                uninstallString = value
+            }
+        }
+        // UninstallString 形如 "C:\...\uninstaller.exe" [参数]，取 exe 所在目录
+        if var u = uninstallString?.trimmingCharacters(in: .whitespaces), !u.isEmpty {
+            if u.hasPrefix("\"") {
+                u = String(u.dropFirst().prefix { $0 != "\"" })
+            } else if let r = u.range(of: ".exe", options: .caseInsensitive) {
+                u = String(u[..<r.upperBound])
+            }
+            if let slash = u.lastIndex(of: "\\") { return String(u[..<slash]) }
+        }
+    }
+    return nil
+}
+
+/// 定位 standalone launcher：优先注册表记录的安装目录，其次扫描默认 Program Files 下一级目录。
+func findStandaloneLauncher() -> (path: String, workDir: String)? {
+    guard let rel = cfg.launcherRelPath else { return nil }
+    if let root = standaloneInstallRoot(), let lp = unixPath(fromWindows: root + "\\" + rel),
+       fm.fileExists(atPath: lp.path) {
+        return (lp.path, lp.deletingLastPathComponent().path)
+    }
+    let relComps = rel.split(separator: "\\").map(String.init)
+    for base in ["drive_c/Program Files", "drive_c/Program Files (x86)"] {
+        let baseURL = winePrefix.appendingPathComponent(base)
+        guard let dirs = try? fm.contentsOfDirectory(at: baseURL, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) else { continue }
+        for d in dirs {
+            let lp = relComps.reduce(d) { $0.appendingPathComponent($1) }
+            if fm.fileExists(atPath: lp.path) { return (lp.path, lp.deletingLastPathComponent().path) }
+        }
+    }
+    return nil
+}
+
 func buildEnv() -> [String: String] {
     // 继承全部系统环境变量（确保卷挂载、文件系统等功能正常）
     // 只覆盖/添加 Wine 专用变量
@@ -1542,11 +1670,12 @@ func downloadInstaller() {
 
     showLoading("正在获取下载地址...")
 
-    // 自动识别两种下载模式（无需手动配置）：
+    // 自动识别三种下载模式（无需手动配置）：
     //   1) JSON 接口：响应体是 {"data":{"download_url":"..."}}，需解析后再下真实文件
-    //   2) 直链：响应体本身就是安装器（PE 可执行），直接落盘即可
-    // 正向判定 JSON：JSON 前缀固定为 '{'（跳过可能的前导空白/BOM）；
-    // 不是 '{' 一律按二进制安装器处理。HTTP 4xx/5xx 已由状态码校验拦下。
+    //   2) 官网下载页：响应体是 HTML，内含 var pc_link = "...exe"（国际服 adl.easebar.com），解析后再下
+    //   3) 直链：响应体本身就是安装器（PE 可执行），直接落盘即可
+    // 按首个有效字符判定：'{' 为 JSON，'<' 为 HTML（跳过可能的前导空白/BOM）；
+    // 其余一律按二进制安装器处理。HTTP 4xx/5xx 已由状态码校验拦下。
     let task = URLSession.shared.downloadTask(with: url) { localURL, response, error in
         if let error {
             DispatchQueue.main.async { showError("获取下载失败: \(error.localizedDescription)") }
@@ -1573,6 +1702,23 @@ func downloadInstaller() {
         }
         let firstNonSpace = bytes.first { $0 != 0x20 && $0 != 0x09 && $0 != 0x0A && $0 != 0x0D }
         let isJSON = (firstNonSpace == 0x7B)  // '{'
+        let isHTML = (firstNonSpace == 0x3C)  // '<'
+
+        if isHTML {
+            // 官网下载页模式：页面脚本按 UA 跳转，PC 安装包地址写在 pc_link 变量里
+            let html = (try? String(contentsOf: src, encoding: .utf8)) ?? ""
+            let re = try! NSRegularExpression(pattern: #"pc_link\s*=\s*["'](https?://[^"']+)["']"#)
+            guard let m = re.firstMatch(in: html, range: NSRange(html.startIndex..., in: html)),
+                  let r = Range(m.range(at: 1), in: html),
+                  let downloadURL = URL(string: String(html[r])) else {
+                log("下载页解析失败: \(html.prefix(200))")
+                DispatchQueue.main.async { showError("解析下载地址失败") }
+                return
+            }
+            log("检测到下载页模式，解析到安装器下载地址: \(downloadURL.absoluteString)")
+            downloadInstallerFile(from: downloadURL)
+            return
+        }
 
         if isJSON {
             // JSON 接口模式：解析 data.download_url 后下载真实文件
@@ -1597,11 +1743,16 @@ func downloadInstaller() {
     task.resume()
 }
 
-/// 第二步：下载真实的安装器文件并保存到 installerPath（JSON 接口模式使用）
+/// 下载进度观察者（持有引用，否则 KVO 立即失效）
+var downloadProgressObservation: NSKeyValueObservation?
+
+/// 第二步：下载真实的安装器文件并保存到 installerPath（JSON 接口 / 下载页模式使用）
 func downloadInstallerFile(from url: URL) {
-    DispatchQueue.main.async { showLoading("正在下载启动器...") }
+    let label = isStandalone ? "正在下载游戏安装包" : "正在下载启动器"
+    DispatchQueue.main.async { showLoading("\(label)...") }
 
     let task = URLSession.shared.downloadTask(with: url) { localURL, response, error in
+        downloadProgressObservation = nil
         if let error {
             DispatchQueue.main.async { showError("下载失败: \(error.localizedDescription)") }
             return
@@ -1616,6 +1767,14 @@ func downloadInstallerFile(from url: URL) {
         }
         saveInstaller(from: src)
     }
+    // 安装包可达数百 MB，显示百分比避免用户以为卡死（取整去重，减少 UI 刷新）
+    var lastPercent = -1
+    downloadProgressObservation = task.progress.observe(\.fractionCompleted) { progress, _ in
+        let percent = Int(progress.fractionCompleted * 100)
+        guard percent != lastPercent else { return }
+        lastPercent = percent
+        DispatchQueue.main.async { loadingView?.updateText("\(label)... \(percent)%") }
+    }
     task.resume()
 }
 
@@ -1626,7 +1785,7 @@ func saveInstaller(from src: URL) {
         try fm.moveItem(at: src, to: installerPath)
         // 移除 extended attributes（防止 Gatekeeper 阻止 Wine 读取）
         shell("/usr/bin/xattr", ["-cr", installerPath.path])
-        DispatchQueue.main.async { installFever() }
+        DispatchQueue.main.async { isStandalone ? installStandalone() : installFever() }
     } catch {
         DispatchQueue.main.async { showError("保存安装器失败") }
     }
@@ -1735,6 +1894,104 @@ func installFeverCore() {
     }
 }
 
+// ============================================================
+// standalone 安装 / 启动（游戏自带 launcher，不经发烧平台）
+// ============================================================
+func installStandalone() {
+    guard wineBinary != nil else { showError("Wine 不可用"); return }
+    guard fm.fileExists(atPath: installerPath.path) else { showError("安装器未找到"); return }
+    showLoading("请在弹出的安装窗口中完成安装...")
+    DispatchQueue.global().async {
+        ensureInjectedWineserver()
+        DispatchQueue.main.async { installStandaloneCore() }
+    }
+}
+
+func installStandaloneCore() {
+    guard let w = wineBinary else { showError("Wine 不可用"); return }
+    let winInstallerPath = "Z:" + installerPath.path.replacingOccurrences(of: "/", with: "\\")
+    log("安装命令: wine \(winInstallerPath)（交互式安装）")
+
+    // 安装器无静默参数：需用户同意协议、选择目录后点击安装，故以安装器进程退出作为结束信号
+    guard let proc = launchWineBackground(exe: w, args: [winInstallerPath], env: buildEnv()) else {
+        showError("安装启动失败")
+        return
+    }
+    log("安装进程已启动")
+
+    DispatchQueue.global().async {
+        var waited = 0
+        while proc.isRunning && waited < 3600 {
+            Thread.sleep(forTimeInterval: 3)
+            waited += 3
+            if waited % 30 == 0 { log("等待安装器退出... (\(waited)s)") }
+        }
+        log("安装器已退出（\(waited) 秒）")
+
+        // wineserver 约每 30 秒把注册表写回磁盘，安装目录不在默认位置时需等落盘后才能定位
+        var launcher = findStandaloneLauncher()
+        var grace = 0
+        while launcher == nil && grace < 45 {
+            Thread.sleep(forTimeInterval: 3)
+            grace += 3
+            launcher = findStandaloneLauncher()
+        }
+        guard let (launcherPath, _) = launcher else {
+            // 保留安装包：用户取消安装后再次双击可直接重装，无需重新下载
+            DispatchQueue.main.async { showError("未检测到已安装的游戏。如果取消了安装，再次双击图标即可重新安装。") }
+            return
+        }
+        log("已安装 launcher: \(launcherPath)")
+        try? fm.removeItem(at: installerPath)
+
+        // 安装器结束时可能已自动拉起 launcher，未拉起则代为启动
+        if isStandaloneRunning() {
+            DispatchQueue.main.async {
+                hideLoading()
+                state = .idle
+                log("安装完成，launcher 已由安装器拉起，状态 → idle")
+            }
+        } else {
+            DispatchQueue.main.async {
+                showLoading("正在启动游戏...")
+                launchGameCore(games[0])
+            }
+        }
+    }
+}
+
+func launchStandaloneCore(_ game: Game) {
+    guard let w = wineBinary else { showError("Wine 不可用"); return }
+    guard let (launcher, workDir) = findStandaloneLauncher() else {
+        showError("未找到游戏启动文件，请重置模拟器环境后重新安装")
+        return
+    }
+    log("启动游戏 \(game.id): \(launcher)")
+    guard launchWineBackground(exe: w, args: [launcher], env: buildEnv(), workDir: workDir) != nil else {
+        showError("启动失败")
+        return
+    }
+
+    DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+        NSApp.deactivate()
+    }
+
+    // launcher 无 FeverGamesWeb 这类"GUI 就绪"信号：等待片刻确认进程未闪退即可
+    DispatchQueue.global().async {
+        Thread.sleep(forTimeInterval: 10)
+        if isStandaloneRunning() {
+            DispatchQueue.main.async {
+                hideLoading()
+                state = .idle
+                log("启动完成，状态 → idle（launcher 进程存活）")
+            }
+        } else {
+            log("launcher 启动后 10 秒内退出")
+            DispatchQueue.main.async { showError("游戏启动失败，请重试") }
+        }
+    }
+}
+
 func launchGame(_ game: Game) {
     guard wineBinary != nil else { showError("Wine 不可用"); return }
     showLoading("正在启动游戏...")
@@ -1746,6 +2003,7 @@ func launchGame(_ game: Game) {
 }
 
 func launchGameCore(_ game: Game) {
+    if isStandalone { launchStandaloneCore(game); return }
     guard let w = wineBinary else { showError("Wine 不可用"); return }
     let env = buildEnv()
     
@@ -1893,7 +2151,18 @@ func startLaunch(_ game: Game) {
         // 盘符管理：映射外接设备到 Wine 盘符
         manageDriveLetters()
 
-        if checkFeverInstalled() {
+        if isStandalone {
+            if findStandaloneLauncher() != nil {
+                log("游戏已安装，直接启动")
+                DispatchQueue.main.async { launchGame(game) }
+            } else if fm.fileExists(atPath: installerPath.path) {
+                log("游戏未安装，复用已下载的安装包")
+                DispatchQueue.main.async { installStandalone() }
+            } else {
+                log("游戏未安装，开始下载")
+                DispatchQueue.main.async { downloadInstaller() }
+            }
+        } else if checkFeverInstalled() {
             log("游戏平台已安装，直接启动")
             DispatchQueue.main.async { launchGame(game) }
         } else {

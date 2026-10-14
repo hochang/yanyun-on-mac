@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>appIdentifier</key>
+	<string>wwm.simulator</string>
+	<key>feverDownloadURL</key>
+	<string>https://adl.easebar.com/d/g/wwm/c/officialwebsite?type=pc</string>
+	<key>platform</key>
+	<string>standalone</string>
+	<key>launcherUninstallKey</key>
+	<string>wwm_launcher_uninstall</string>
+	<key>launcherRelPath</key>
+	<string>Win32\deploy\launcher.exe</string>
+	<key>gameKey</key>
+	<string>wwm</string>
+	<key>title</key>
+	<string>燕云国际服</string>
+	<key>windowTitle</key>
+	<string>燕云国际服模拟器</string>
+	<key>aboutTitle</key>
+	<string>关于燕云国际服模拟器</string>
+	<key>volumeSkipName</key>
+	<string>WWM</string>
+	<key>qqGroup</key>
+	<string>1080300274</string>
+	<key>productName</key>
+	<string>WWM</string>
+</dict>
+</plist>

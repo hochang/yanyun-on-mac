@@ -4,6 +4,11 @@
 
 ## [Unreleased]
 
+### Added
+- 增加支持燕云国际服（Where Winds Meet），单独出包 WWM.dmg，与国服数据互不影响
+- 支持不经发烧平台、直接安装运行游戏自带 launcher 的 standalone 模式（config.plist `platform`）
+- 下载支持官网下载页链接（自动解析 PC 安装包地址），大安装包显示下载百分比
+
 ## [0.1.2] - 2026-08-06
 
 ### Added
